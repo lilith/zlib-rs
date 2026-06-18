@@ -30,10 +30,12 @@ cfg_select! {
     }
 }
 
+mod cancel;
 mod cpu_features;
 mod stable;
 mod weak_slice;
 
+pub use cancel::{CancelCheck, CancelledOr, NeverCancel};
 pub use stable::{Deflate, DeflateError, Inflate, InflateError, Status};
 
 pub use deflate::{DeflateConfig, Method, Strategy};

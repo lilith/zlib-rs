@@ -9,7 +9,7 @@ use crate::{
     DeflateFlush,
 };
 
-pub fn deflate_slow(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockState {
+pub fn deflate_slow(stream: &mut DeflateStream, flush: DeflateFlush, cancel: &dyn crate::CancelCheck) -> BlockState {
     let mut hash_head; /* head of hash chain */
     let mut bflush; /* set if current block must be flushed */
     let mut dist;
@@ -21,7 +21,11 @@ pub fn deflate_slow(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockSta
     let mut match_available = stream.state.match_available;
 
     /* Process the input block. */
+    let mut cancel = crate::cancel::Debounced::new(cancel, crate::cancel::CANCEL_POLL_INTERVAL);
     loop {
+        if cancel.is_cancelled() {
+            return BlockState::NeedMore;
+        }
         /* Make sure that we always have enough lookahead, except
          * at the end of the input file. We need STD_MAX_MATCH bytes
          * for the next match, plus WANT_MIN_MATCH bytes to insert the

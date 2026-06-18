@@ -5,6 +5,7 @@ use crate::{
     allocate::Allocator,
     c_api::{gz_header, internal_state, z_checksum, z_stream},
     crc32::{crc32, Crc32Fold},
+    cancel::{CancelCheck, NeverCancel},
     trace,
     weak_slice::{WeakArrayMut, WeakSliceMut},
     DeflateFlush, ReturnCode, ADLER32_INITIAL_VALUE, CRC32_INITIAL_VALUE, MAX_WBITS, MIN_WBITS,
@@ -2468,6 +2469,17 @@ fn flush_bytes(stream: &mut DeflateStream, mut bytes: &[u8]) -> ControlFlow<Retu
 }
 
 pub fn deflate(stream: &mut DeflateStream, flush: DeflateFlush) -> ReturnCode {
+    deflate_with_cancel(stream, flush, &NeverCancel)
+}
+
+/// Like [`deflate`], but polls `cancel` between internal compression steps and
+/// leaves early (resumable) when it asks to cancel. The Rust [`Deflate`](crate::Deflate)
+/// API turns an early cancel into `Err(`[`CancelledOr::Cancelled`](crate::CancelledOr::Cancelled)`)`.
+pub(crate) fn deflate_with_cancel(
+    stream: &mut DeflateStream,
+    flush: DeflateFlush,
+    cancel: &dyn CancelCheck,
+) -> ReturnCode {
     if stream.next_out.is_null()
         || (stream.avail_in != 0 && stream.next_in.is_null())
         || (stream.state.status == Status::Finish && flush != DeflateFlush::Finish)
@@ -2683,7 +2695,7 @@ pub fn deflate(stream: &mut DeflateStream, flush: DeflateFlush) -> ReturnCode {
         || state.lookahead != 0
         || (flush != DeflateFlush::NoFlush && state.status != Status::Finish)
     {
-        let bstate = self::algorithm::run(stream, flush);
+        let bstate = self::algorithm::run(stream, flush, cancel);
 
         let state = &mut stream.state;
 

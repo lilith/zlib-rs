@@ -16,6 +16,7 @@ mod writer;
 use crate::allocate::Allocator;
 use crate::c_api::internal_state;
 use crate::cpu_features::CpuFeatures;
+use crate::cancel::{CancelCheck, NeverCancel};
 use crate::{
     adler32::adler32,
     c_api::{gz_header, z_checksum, z_size, z_stream, Z_DEFLATED},
@@ -437,6 +438,10 @@ pub(crate) struct State<'a> {
 
     error_message: Option<&'static str>,
 
+    /// set when a cooperative cancel check asked to cancel mid-dispatch; the Rust
+    /// API turns this into `Err(`[`CancelledOr::Cancelled`](crate::CancelledOr::Cancelled)`)`
+    pub(crate) cancelled: bool,
+
     /// place to store gzip header if needed
     head: Option<&'a mut gz_header>,
     dmax: usize,
@@ -503,6 +508,7 @@ impl<'a> State<'a> {
             next: 0,
 
             error_message: None,
+            cancelled: false,
 
             checksum: 0,
             crc_fold: Crc32Fold::new(),
@@ -895,9 +901,15 @@ impl State<'_> {
         }
     }
 
-    fn dispatch(&mut self) -> ReturnCode {
+    fn dispatch(&mut self, cancel: &dyn CancelCheck) -> ReturnCode {
         // Note: All early returns must save mode into self.mode again.
         let mut mode = self.mode;
+
+        // Poll the cooperative cancellation check through a debounce, so the
+        // hot state-machine loop touches the user's closure only once every
+        // `CANCEL_POLL_INTERVAL` steps. When no cancel is set (the default), the
+        // debounce holds `None` and polling is a single predicted branch.
+        let mut cancel = crate::cancel::Debounced::new(cancel, crate::cancel::CANCEL_POLL_INTERVAL);
 
         macro_rules! pull_byte {
             ($self:expr) => {
@@ -924,6 +936,11 @@ impl State<'_> {
         }
 
         let ret = 'label: loop {
+            if cancel.is_cancelled() {
+                self.cancelled = true;
+                self.mode = mode;
+                break 'label self.inflate_leave(ReturnCode::Ok);
+            }
             mode = 'blk: {
                 match mode {
                     Mode::Head => {
@@ -2380,6 +2397,19 @@ pub fn codes_used(stream: &InflateStream) -> usize {
 }
 
 pub unsafe fn inflate(stream: &mut InflateStream, flush: InflateFlush) -> ReturnCode {
+    // SAFETY: forwarded unchanged; `NeverCancel` adds no cancellation behaviour.
+    unsafe { inflate_with_cancel(stream, flush, &NeverCancel) }
+}
+
+/// Like [`inflate`], but polls `cancel` between internal state-machine steps and
+/// leaves early (resumable) when it asks to cancel. The early cancel is recorded in
+/// `State::cancelled`, which the Rust [`Inflate`](crate::Inflate) API turns into
+/// `Err(`[`CancelledOr::Cancelled`](crate::CancelledOr::Cancelled)`)`.
+pub(crate) unsafe fn inflate_with_cancel(
+    stream: &mut InflateStream,
+    flush: InflateFlush,
+    cancel: &dyn CancelCheck,
+) -> ReturnCode {
     if stream.next_out.is_null() || (stream.next_in.is_null() && stream.avail_in != 0) {
         return ReturnCode::StreamError;
     }
@@ -2404,7 +2434,7 @@ pub unsafe fn inflate(stream: &mut InflateStream, flush: InflateFlush) -> Return
     state.in_available = stream.avail_in as _;
     state.out_available = stream.avail_out as _;
 
-    let err = state.dispatch();
+    let err = state.dispatch(cancel);
 
     let in_read = state.bit_reader.as_ptr() as usize - stream.next_in as usize;
     let out_written = state.out_available - (state.writer.capacity() - state.writer.len());

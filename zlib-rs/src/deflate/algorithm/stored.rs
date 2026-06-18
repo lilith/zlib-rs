@@ -5,7 +5,7 @@ use crate::{
     DeflateFlush,
 };
 
-pub fn deflate_stored(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockState {
+pub fn deflate_stored(stream: &mut DeflateStream, flush: DeflateFlush, cancel: &dyn crate::CancelCheck) -> BlockState {
     // Smallest worthy block size when not flushing or finishing. By default
     // this is 32K. This can be as small as 507 bytes for memLevel == 1. For
     // large input and output buffers, the stored block size will be larger.
@@ -22,7 +22,11 @@ pub fn deflate_stored(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockS
     let mut have;
     let mut last = false;
     let mut used = stream.avail_in;
+    let mut cancel = crate::cancel::Debounced::new(cancel, crate::cancel::CANCEL_POLL_INTERVAL);
     loop {
+        if cancel.is_cancelled() {
+            return BlockState::NeedMore;
+        }
         // maximum deflate stored block length
         let mut len = MAX_STORED;
 

@@ -1,5 +1,6 @@
 use core::{ffi::c_uint, mem::MaybeUninit};
 
+use crate::cancel::{CancelCheck, NeverCancel};
 use crate::deflate::DeflateConfig;
 use crate::inflate::InflateConfig;
 use crate::ReturnCode;
@@ -170,6 +171,48 @@ impl Inflate {
         output: &mut [MaybeUninit<u8>],
         flush: InflateFlush,
     ) -> Result<Status, InflateError> {
+        self.decompress_uninit_with_cancel(input, output, flush, &NeverCancel)
+            .map_err(|err| match err {
+                crate::CancelledOr::Error(error) => error,
+                // `NeverCancel` cannot cancel, so this arm is unreachable; collapse it
+                // defensively to keep the no-cancel conversion total and panic-free.
+                crate::CancelledOr::Cancelled => InflateError::StreamError,
+            })
+    }
+
+    /// Like [`Inflate::decompress`], but polls `cancel` between internal steps and
+    /// returns `Err(`[`CancelledOr::Cancelled`](crate::CancelledOr::Cancelled)`)` as soon as it asks to cancel,
+    /// leaving the stream in a resumable state.
+    ///
+    /// This bounds the time spent on adversarial input — for example a run of
+    /// empty stored blocks (tiny output, huge input) on which an output-size
+    /// check would never fire. Any `Fn() -> bool` that is `Send + Sync` works
+    /// as the check; pass [`NeverCancel`] (as [`decompress`](Self::decompress)
+    /// does) for no cancellation.
+    pub fn decompress_with_cancel(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        flush: InflateFlush,
+        cancel: &impl CancelCheck,
+    ) -> Result<Status, crate::CancelledOr<InflateError>> {
+        self.decompress_uninit_with_cancel(
+            input,
+            unsafe { &mut *(output as *mut _ as *mut [MaybeUninit<u8>]) },
+            flush,
+            cancel,
+        )
+    }
+
+    /// [`Inflate::decompress_with_cancel`] writing into a potentially
+    /// uninitialized `output`.
+    pub fn decompress_uninit_with_cancel(
+        &mut self,
+        input: &[u8],
+        output: &mut [MaybeUninit<u8>],
+        flush: InflateFlush,
+        cancel: &impl CancelCheck,
+    ) -> Result<Status, crate::CancelledOr<InflateError>> {
         // Limit the length of the input and output to the maximum value of a c_uint. For larger
         // inputs, this will either complete or signal that more input and output is needed. The
         // caller should be able to handle this regardless.
@@ -184,12 +227,18 @@ impl Inflate {
         let start_out = self.inner.next_out;
 
         // SAFETY: the inflate state was properly initialized.
-        let ret = unsafe { crate::inflate::inflate(&mut self.inner, flush) };
+        let ret = unsafe { crate::inflate::inflate_with_cancel(&mut self.inner, flush, cancel) };
 
         self.total_in += (self.inner.next_in as usize - start_in as usize) as u64;
         self.total_out += (self.inner.next_out as usize - start_out as usize) as u64;
 
-        match ret {
+        // `dispatch` left early because the cancel check fired; surface that
+        // rather than the benign `Ok` it returned to leave the stream resumable.
+        if core::mem::take(&mut self.inner.state.cancelled) {
+            return Err(crate::CancelledOr::Cancelled);
+        }
+
+        let result: Result<Status, InflateError> = match ret {
             ReturnCode::Ok => Ok(Status::Ok),
             ReturnCode::StreamEnd => Ok(Status::StreamEnd),
             ReturnCode::NeedDict => Err(InflateError::NeedDict {
@@ -201,7 +250,9 @@ impl Inflate {
             ReturnCode::MemError => Err(InflateError::MemError),
             ReturnCode::BufError => Ok(Status::BufError),
             ReturnCode::VersionError => unreachable!("the rust API does not use the version"),
-        }
+        };
+
+        result.map_err(crate::CancelledOr::Error)
     }
 
     pub fn set_dictionary(&mut self, dictionary: &[u8]) -> Result<u32, InflateError> {
@@ -343,6 +394,48 @@ impl Deflate {
         output: &mut [MaybeUninit<u8>],
         flush: DeflateFlush,
     ) -> Result<Status, DeflateError> {
+        self.compress_uninit_with_cancel(input, output, flush, &NeverCancel)
+            .map_err(|err| match err {
+                crate::CancelledOr::Error(error) => error,
+                // `NeverCancel` cannot cancel, so this arm is unreachable; collapse it
+                // defensively to keep the no-cancel conversion total and panic-free.
+                crate::CancelledOr::Cancelled => DeflateError::StreamError,
+            })
+    }
+
+    /// Like [`Deflate::compress`], but polls `cancel` between internal steps and
+    /// returns `Err(`[`CancelledOr::Cancelled`](crate::CancelledOr::Cancelled)`)` as soon as it asks to cancel,
+    /// leaving the stream in a resumable state.
+    ///
+    /// Compression has no untrusted-input "bomb" the way decompression does, so
+    /// this is mainly useful for aborting a long compression of your own data
+    /// (e.g. on a deadline). Any `Fn() -> bool` that is `Send + Sync` works as
+    /// the check; pass [`NeverCancel`] (as [`compress`](Self::compress) does)
+    /// for no cancellation.
+    pub fn compress_with_cancel(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        flush: DeflateFlush,
+        cancel: &impl CancelCheck,
+    ) -> Result<Status, crate::CancelledOr<DeflateError>> {
+        self.compress_uninit_with_cancel(
+            input,
+            unsafe { &mut *(output as *mut _ as *mut [MaybeUninit<u8>]) },
+            flush,
+            cancel,
+        )
+    }
+
+    /// [`Deflate::compress_with_cancel`] writing into a potentially uninitialized
+    /// `output`.
+    pub fn compress_uninit_with_cancel(
+        &mut self,
+        input: &[u8],
+        output: &mut [MaybeUninit<u8>],
+        flush: DeflateFlush,
+        cancel: &impl CancelCheck,
+    ) -> Result<Status, crate::CancelledOr<DeflateError>> {
         // Limit the length of the input and output to the maximum value of a c_uint. For larger
         // inputs, this will either complete or signal that more input and output is needed. The
         // caller should be able to handle this regardless.
@@ -356,12 +449,21 @@ impl Deflate {
         let start_in = self.inner.next_in;
         let start_out = self.inner.next_out;
 
-        let ret = crate::deflate::deflate(&mut self.inner, flush).into();
+        let ret: Result<Status, DeflateError> =
+            crate::deflate::deflate_with_cancel(&mut self.inner, flush, cancel).into();
 
         self.total_in += (self.inner.next_in as usize - start_in as usize) as u64;
         self.total_out += (self.inner.next_out as usize - start_out as usize) as u64;
 
-        ret
+        // A strategy left its loop early because the cancel fired (returning
+        // `NeedMore`, i.e. not `StreamEnd`); surface that as cancellation. The
+        // `StreamEnd` guard means a compression that actually finished is never
+        // masked as cancelled.
+        if !matches!(ret, Ok(Status::StreamEnd)) && cancel.is_cancelled() {
+            return Err(crate::CancelledOr::Cancelled);
+        }
+
+        ret.map_err(crate::CancelledOr::Error)
     }
 
     /// Specifies the compression dictionary to use.

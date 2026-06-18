@@ -9,7 +9,7 @@ use crate::{
     DeflateFlush,
 };
 
-pub fn deflate_quick(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockState {
+pub fn deflate_quick(stream: &mut DeflateStream, flush: DeflateFlush, cancel: &dyn crate::CancelCheck) -> BlockState {
     let mut state = &mut stream.state;
 
     macro_rules! quick_end_block {
@@ -56,7 +56,11 @@ pub fn deflate_quick(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockSt
         quick_start_block!(last);
     }
 
+    let mut cancel = crate::cancel::Debounced::new(cancel, crate::cancel::CANCEL_POLL_INTERVAL);
     loop {
+        if cancel.is_cancelled() {
+            return BlockState::NeedMore;
+        }
         if state.bit_writer.pending.pending + State::BIT_BUF_SIZE.div_ceil(8) as usize
             >= state.pending_buf_size()
         {

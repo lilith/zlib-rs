@@ -9,7 +9,7 @@ use crate::{
     DeflateFlush,
 };
 
-pub fn deflate_medium(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockState {
+pub fn deflate_medium(stream: &mut DeflateStream, flush: DeflateFlush, cancel: &dyn crate::CancelCheck) -> BlockState {
     let mut state = &mut stream.state;
 
     // For levels below 5, don't check the next position for a better match
@@ -28,7 +28,11 @@ pub fn deflate_medium(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockS
         orgstart: 0,
     };
 
+    let mut cancel = crate::cancel::Debounced::new(cancel, crate::cancel::CANCEL_POLL_INTERVAL);
     loop {
+        if cancel.is_cancelled() {
+            return BlockState::NeedMore;
+        }
         let mut hash_head;
 
         /* Make sure that we always have enough lookahead, except

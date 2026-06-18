@@ -1,6 +1,6 @@
 use crate::{
     deflate::{BlockState, DeflateStream, Strategy},
-    DeflateFlush,
+    DeflateFlush, CancelCheck,
 };
 
 use self::{huff::deflate_huff, rle::deflate_rle, stored::deflate_stored};
@@ -27,18 +27,18 @@ macro_rules! flush_block {
 }
 pub(crate) use flush_block;
 
-pub fn run(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockState {
+pub fn run(stream: &mut DeflateStream, flush: DeflateFlush, cancel: &dyn CancelCheck) -> BlockState {
     match stream.state.strategy {
-        _ if stream.state.level == 0 => deflate_stored(stream, flush),
-        Strategy::HuffmanOnly => deflate_huff(stream, flush),
-        Strategy::Rle => deflate_rle(stream, flush),
+        _ if stream.state.level == 0 => deflate_stored(stream, flush, cancel),
+        Strategy::HuffmanOnly => deflate_huff(stream, flush, cancel),
+        Strategy::Rle => deflate_rle(stream, flush, cancel),
         Strategy::Default | Strategy::Filtered | Strategy::Fixed => {
-            (CONFIGURATION_TABLE[stream.state.level as usize].func)(stream, flush)
+            (CONFIGURATION_TABLE[stream.state.level as usize].func)(stream, flush, cancel)
         }
     }
 }
 
-type CompressFunc = fn(&mut DeflateStream, flush: DeflateFlush) -> BlockState;
+type CompressFunc = fn(&mut DeflateStream, DeflateFlush, &dyn CancelCheck) -> BlockState;
 
 pub struct Config {
     pub good_length: u16, /* reduce lazy search above this match length */

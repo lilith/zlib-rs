@@ -9,11 +9,15 @@ use crate::{
     DeflateFlush,
 };
 
-pub fn deflate_rle(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockState {
+pub fn deflate_rle(stream: &mut DeflateStream, flush: DeflateFlush, cancel: &dyn crate::CancelCheck) -> BlockState {
     let mut match_len = 0;
     let mut bflush;
 
+    let mut cancel = crate::cancel::Debounced::new(cancel, crate::cancel::CANCEL_POLL_INTERVAL);
     loop {
+        if cancel.is_cancelled() {
+            return BlockState::NeedMore;
+        }
         // Make sure that we always have enough lookahead, except
         // at the end of the input file. We need STD_MAX_MATCH bytes
         // for the next match, plus WANT_MIN_MATCH bytes to insert the

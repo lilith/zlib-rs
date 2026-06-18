@@ -6,8 +6,12 @@ use crate::{
     DeflateFlush,
 };
 
-pub fn deflate_huff(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockState {
+pub fn deflate_huff(stream: &mut DeflateStream, flush: DeflateFlush, cancel: &dyn crate::CancelCheck) -> BlockState {
+    let mut cancel = crate::cancel::Debounced::new(cancel, crate::cancel::CANCEL_POLL_INTERVAL);
     loop {
+        if cancel.is_cancelled() {
+            return BlockState::NeedMore;
+        }
         /* Make sure that we have a literal to write. */
         if stream.state.lookahead == 0 {
             fill_window(stream);
